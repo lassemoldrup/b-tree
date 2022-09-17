@@ -127,18 +127,19 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
         self.insert_child(idx + 1, new_child);
     }
 
-    fn insert_non_full(&mut self, key: K, value: V) {
+    fn insert_non_full(&mut self, key: K, value: V) -> Result<(), (K, V)> {
         debug_assert!(!self.is_full());
-
-        self.aug_val = A::inserted_sub_tree(&key, &value, &self.aug_val);
 
         // We ignore duplicates
         let mut idx = match self.find_key_idx(&key) {
-            Ok(_) => return,
+            Ok(_) => return Err((key, value)),
             Err(i) => i,
         };
+
         if self.leaf {
+            self.aug_val = A::inserted_sub_tree(&key, &value, &self.aug_val);
             self.insert_pair(idx, (key, value));
+            Ok(())
         } else {
             if self.children[idx].is_full() {
                 // Safety: Child is definitely full and `split_child`
@@ -149,12 +150,20 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
                 };
 
                 if &key == split_key {
-                    return;
+                    return Err((key, value));
                 } else if &key > split_key {
                     idx += 1;
                 }
             }
-            self.children[idx].insert_non_full(key, value);
+
+            self.aug_val = A::inserted_sub_tree(&key, &value, &self.aug_val);
+            // If we end up not inserting the key, because it is a duplicate, undo the augment update
+            self.children[idx]
+                .insert_non_full(key, value)
+                .map_err(|(k, v)| {
+                    self.aug_val = A::deleted_sub_tree(&k, &v, &self.aug_val);
+                    (k, v)
+                })
         }
     }
 
@@ -343,7 +352,7 @@ impl<K: Ord, V> BTree<K, V> {
 }
 
 impl<K: Ord, V, A: Augment<K, V>> BTree<K, V, A> {
-    pub fn insert(&mut self, key: K, value: V) {
+    pub fn insert(&mut self, key: K, value: V) -> bool {
         if self.root.is_full() {
             let (root_pair, child) = unsafe { self.root.split() };
 
@@ -358,7 +367,7 @@ impl<K: Ord, V, A: Augment<K, V>> BTree<K, V, A> {
             self.root.n = 1;
         }
 
-        self.root.insert_non_full(key, value);
+        self.root.insert_non_full(key, value).is_ok()
     }
 
     pub fn delete(&mut self, key: &K) {
@@ -387,8 +396,8 @@ mod tests {
         assert!(tree.search(&100).is_none());
 
         for i in 0..1000 {
-            tree.insert(i, ());
-            tree.insert(i, ());
+            assert!(tree.insert(i, ()));
+            assert!(!tree.insert(i, ()));
         }
         for i in (3000..4000).rev() {
             tree.insert(i, ());

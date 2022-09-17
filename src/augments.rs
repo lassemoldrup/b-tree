@@ -162,6 +162,7 @@ mod tests {
         }
         for i in (3500..4000).rev() {
             tree.insert(i, i);
+            tree.insert(i, i);
         }
 
         assert_eq!(tree.augment_search(&2000), (0..1000).sum());
