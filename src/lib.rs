@@ -284,8 +284,10 @@ impl<K: Ord, V> BTree<K, V> {
     }
 
     pub fn delete(&mut self, key: &K) {
-        // TODO: Delete empty root
         self.root.delete(key);
+        if self.root.children.len() == 1 {
+            self.root = self.root.children.pop().unwrap();
+        }
     }
 
     pub fn search(&self, key: &K) -> Option<&V> {
