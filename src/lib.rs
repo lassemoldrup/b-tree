@@ -1,35 +1,38 @@
-use std::fmt::Debug;
-use std::mem;
+use std::mem::{self, MaybeUninit};
 
 const MIN_DEGREE: usize = 4;
 
 struct Node<V> {
     n: usize,
-    keys: [V; 2 * MIN_DEGREE - 1],
+    keys: [MaybeUninit<V>; 2 * MIN_DEGREE - 1],
     children: Vec<Self>,
     leaf: bool,
 }
 
-impl<V: Ord + Copy + Default> Node<V> {
+impl<V: Ord> Node<V> {
+    const NEW_KEY: MaybeUninit<V> = MaybeUninit::uninit();
+
     fn new_root() -> Self {
         Self {
             n: 0,
-            keys: [V::default(); 2 * MIN_DEGREE - 1],
+            keys: [Self::NEW_KEY; 2 * MIN_DEGREE - 1],
             children: Vec::with_capacity(2 * MIN_DEGREE),
             leaf: true,
         }
     }
 
-    fn split(&mut self) -> (V, Self) {
-        let median = self.keys[MIN_DEGREE - 1];
+    unsafe fn split(&mut self) -> (V, Self) {
+        debug_assert!(self.is_full());
 
-        let mut keys = [V::default(); 2 * MIN_DEGREE - 1];
+        let median = self.keys[MIN_DEGREE - 1].assume_init_read();
+
+        let mut keys = [Self::NEW_KEY; 2 * MIN_DEGREE - 1];
         self.keys[MIN_DEGREE..].swap_with_slice(&mut keys[..MIN_DEGREE - 1]);
 
-        let children = if !self.leaf {
-            self.children.split_off(MIN_DEGREE)
-        } else {
+        let children = if self.leaf {
             Vec::with_capacity(2 * MIN_DEGREE)
+        } else {
+            self.children.split_off(MIN_DEGREE)
         };
         self.n = MIN_DEGREE - 1;
 
@@ -45,9 +48,12 @@ impl<V: Ord + Copy + Default> Node<V> {
 
     fn insert_key(&mut self, idx: usize, key: V) {
         debug_assert!(!self.is_full());
+        debug_assert!(idx <= self.n);
 
-        self.keys.copy_within(idx..self.n, idx + 1);
-        self.keys[idx] = key;
+        for i in (idx + 1..=self.n).rev() {
+            self.keys[i] = MaybeUninit::new(unsafe { self.keys[i - 1].assume_init_read() });
+        }
+        self.keys[idx] = MaybeUninit::new(key);
         self.n += 1;
     }
 
@@ -56,10 +62,12 @@ impl<V: Ord + Copy + Default> Node<V> {
     }
 
     fn find_key_idx(&self, key: &V) -> Result<usize, usize> {
-        self.keys[..self.n].binary_search(key)
+        self.keys[..self.n].binary_search_by_key(&key, |k| unsafe { k.assume_init_ref() })
     }
 
-    fn split_child(&mut self, idx: usize) {
+    /// # Safety
+    /// Child at `idx` must be full
+    unsafe fn split_child(&mut self, idx: usize) {
         let (median, new_child) = self.children[idx].split();
         self.insert_key(idx, median);
         self.insert_child(idx + 1, new_child);
@@ -77,12 +85,16 @@ impl<V: Ord + Copy + Default> Node<V> {
             self.insert_key(idx, key);
         } else {
             if self.children[idx].is_full() {
-                self.split_child(idx);
-                let split_key = self.keys[idx];
+                // Safety: Child is definitely full and `split_child`
+                // ensures that `self.keys[idx]` is initialized
+                let split_key = unsafe {
+                    self.split_child(idx);
+                    self.keys[idx].assume_init_ref()
+                };
 
-                if key == split_key {
+                if &key == split_key {
                     return;
-                } else if key > split_key {
+                } else if &key > split_key {
                     idx += 1;
                 }
             }
@@ -90,20 +102,27 @@ impl<V: Ord + Copy + Default> Node<V> {
         }
     }
 
-    fn remove_key(&mut self, idx: usize) -> V {
-        let key = self.keys[idx];
-        self.keys.copy_within(idx + 1..self.n, idx);
+    /// # Safety
+    /// `idx` must be in the interval `[0; self.n)`
+    unsafe fn remove_key(&mut self, idx: usize) -> V {
+        // Extract ownership of the key without using extra work
+        let key = self.keys[idx].assume_init_read();
         self.n -= 1;
+        for i in idx..self.n {
+            self.keys[i] = MaybeUninit::new(self.keys[i + 1].assume_init_read());
+        }
         key
     }
 
     fn delete_max(&mut self) -> V {
         if self.leaf {
-            return self.remove_key(self.n - 1);
+            return unsafe { self.remove_key(self.n - 1) };
         }
 
         if self.children[self.n].is_min() {
-            self.make_space(self.n);
+            unsafe {
+                self.make_space(self.n);
+            }
         }
 
         self.children[self.n].delete_max()
@@ -111,52 +130,62 @@ impl<V: Ord + Copy + Default> Node<V> {
 
     fn delete_min(&mut self) -> V {
         if self.leaf {
-            return self.remove_key(0);
+            return unsafe { self.remove_key(0) };
         }
 
         if self.children[0].is_min() {
-            self.make_space(0);
+            unsafe {
+                self.make_space(0);
+            }
         }
 
         self.children[0].delete_min()
     }
 
-    // Assumes child `idx` and `idx + 1` have mininum degree
-    fn merge_children(&mut self, idx: usize) {
+    /// # Safety
+    /// Child `idx` and `idx + 1` must exist and have have mininum degree
+    unsafe fn merge_children(&mut self, idx: usize) {
+        let parent_key = self.remove_key(idx);
+
         let mut right_child = self.children.remove(idx + 1);
         let left_child = &mut self.children[idx];
 
-        left_child.keys[MIN_DEGREE - 1] = self.keys[idx];
-        left_child.keys[MIN_DEGREE..].copy_from_slice(&right_child.keys[..MIN_DEGREE - 1]);
+        left_child.keys[MIN_DEGREE - 1] = MaybeUninit::new(parent_key);
+        for i in 0..MIN_DEGREE - 1 {
+            let key = right_child.keys[i].assume_init_read();
+            left_child.keys[i + MIN_DEGREE] = MaybeUninit::new(key);
+        }
         left_child.n = 2 * MIN_DEGREE - 1;
 
         if !left_child.leaf {
             left_child.children.append(&mut right_child.children);
         }
-
-        self.remove_key(idx);
     }
 
-    fn delete_own(&mut self, idx: usize) {
+    /// # Safety
+    /// `idx` must be in the range `[0; self.n)`
+    unsafe fn delete_own(&mut self, idx: usize) {
         if self.leaf {
             self.remove_key(idx);
         } else if !self.children[idx].is_min() {
-            self.keys[idx] = self.children[idx].delete_max();
+            self.keys[idx] = MaybeUninit::new(self.children[idx].delete_max());
         } else if !self.children[idx + 1].is_min() {
-            self.keys[idx] = self.children[idx + 1].delete_min();
+            self.keys[idx] = MaybeUninit::new(self.children[idx + 1].delete_min());
         } else {
             self.merge_children(idx);
             self.children[idx].delete_own(MIN_DEGREE - 1);
         }
     }
 
-    fn make_space(&mut self, mut idx: usize) -> usize {
+    /// # Safety
+    /// Child with index `idx` must exist and not be full
+    unsafe fn make_space(&mut self, mut idx: usize) -> usize {
         if idx > 0 && !self.children[idx - 1].is_min() {
             // Steal a key from the left sibling (through parent)
-            self.children[idx].insert_key(0, self.keys[idx - 1]);
+            self.children[idx].insert_key(0, self.keys[idx - 1].assume_init_read());
 
             let sibling = &mut self.children[idx - 1];
-            self.keys[idx - 1] = sibling.remove_key(sibling.n - 1);
+            self.keys[idx - 1] = MaybeUninit::new(sibling.remove_key(sibling.n - 1));
 
             if !sibling.leaf {
                 let last_child = sibling.children.pop().unwrap();
@@ -165,10 +194,10 @@ impl<V: Ord + Copy + Default> Node<V> {
         } else if idx < self.n && !self.children[idx + 1].is_min() {
             // Steal a key from the right sibling (through parent)
             let child_n = self.children[idx].n;
-            self.children[idx].insert_key(child_n, self.keys[idx]);
+            self.children[idx].insert_key(child_n, self.keys[idx].assume_init_read());
 
             let sibling = &mut self.children[idx + 1];
-            self.keys[idx] = sibling.remove_key(0);
+            self.keys[idx] = MaybeUninit::new(sibling.remove_key(0));
 
             if !sibling.leaf {
                 let first_child = sibling.children.remove(0);
@@ -192,7 +221,7 @@ impl<V: Ord + Copy + Default> Node<V> {
         }
 
         if self.children[idx].is_min() {
-            idx = self.make_space(idx);
+            idx = unsafe { self.make_space(idx) };
         }
 
         self.children[idx].delete(key);
@@ -200,7 +229,7 @@ impl<V: Ord + Copy + Default> Node<V> {
 
     fn delete(&mut self, key: &V) {
         match self.find_key_idx(key) {
-            Ok(idx) => self.delete_own(idx),
+            Ok(idx) => unsafe { self.delete_own(idx) },
             Err(idx) => self.delete_in_decendant(idx, key),
         }
     }
@@ -231,7 +260,7 @@ pub struct BTree<V> {
     root: Node<V>,
 }
 
-impl<V: Ord + Copy + Default + Debug> BTree<V> {
+impl<V: Ord> BTree<V> {
     pub fn new() -> Self {
         BTree {
             root: Node::new_root(),
@@ -240,11 +269,11 @@ impl<V: Ord + Copy + Default + Debug> BTree<V> {
 
     pub fn insert(&mut self, key: V) {
         if self.root.is_full() {
-            let (root_key, child) = self.root.split();
+            let (root_key, child) = unsafe { self.root.split() };
             let mut old_root = Node::new_root();
             mem::swap(&mut self.root, &mut old_root);
 
-            self.root.keys[0] = root_key;
+            self.root.keys[0] = MaybeUninit::new(root_key);
             self.root.children.push(old_root);
             self.root.children.push(child);
             self.root.leaf = false;
