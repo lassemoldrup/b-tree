@@ -1,4 +1,5 @@
-use std::fmt::Debug;
+use std::cmp::Ordering;
+use std::fmt::{self, Debug, Formatter};
 use std::mem::{self, MaybeUninit};
 
 pub mod augments;
@@ -30,6 +31,17 @@ pub trait Augment<K, V> {
 
     fn split_root(root_pair: &(K, V), left: &Self::Value, right: &Self::Value) -> Self::Value;
 
+    fn merge(parent_pair: &(K, V), left: &Self::Value, right: &Self::Value) -> Self::Value;
+
+    /// Should return (Thief, Victim)
+    fn steal(
+        parent_pair: &(K, V),
+        victim_pair: &(K, V),
+        stolen_child: Option<&Self::Value>,
+        thief: &Self::Value,
+        victim: &Self::Value,
+    ) -> (Self::Value, Self::Value);
+
     fn visit<'a>(
         found: bool,
         idx: usize,
@@ -42,12 +54,10 @@ pub trait Augment<K, V> {
         Self::Value: 'a;
 }
 
-#[derive(Debug)]
 struct Node<K, V, A: Augment<K, V>> {
     n: usize,
     keys: [MaybeUninit<(K, V)>; 2 * MIN_DEGREE - 1],
     children: Vec<Self>,
-    leaf: bool,
     aug_val: A::Value,
 }
 
@@ -59,7 +69,6 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
             n: 0,
             keys: [Self::NEW_KEY; 2 * MIN_DEGREE - 1],
             children: Vec::with_capacity(2 * MIN_DEGREE),
-            leaf: true,
             aug_val: A::initial_value(),
         }
     }
@@ -72,7 +81,7 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
         let mut keys = [Self::NEW_KEY; 2 * MIN_DEGREE - 1];
         self.keys[MIN_DEGREE..].swap_with_slice(&mut keys[..MIN_DEGREE - 1]);
 
-        let children = if self.leaf {
+        let children = if self.is_leaf() {
             Vec::with_capacity(2 * MIN_DEGREE)
         } else {
             self.children.split_off(MIN_DEGREE)
@@ -93,7 +102,6 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
             n: MIN_DEGREE - 1,
             keys,
             children,
-            leaf: self.leaf,
             aug_val: augment,
         };
 
@@ -136,7 +144,7 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
             Err(i) => i,
         };
 
-        if self.leaf {
+        if self.is_leaf() {
             self.aug_val = A::inserted_sub_tree(&key, &value, &self.aug_val);
             self.insert_pair(idx, (key, value));
             Ok(())
@@ -149,10 +157,10 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
                     &self.keys[idx].assume_init_ref().0
                 };
 
-                if &key == split_key {
-                    return Err((key, value));
-                } else if &key > split_key {
-                    idx += 1;
+                match key.cmp(split_key) {
+                    Ordering::Equal => return Err((key, value)),
+                    Ordering::Greater => idx += 1,
+                    Ordering::Less => {}
                 }
             }
 
@@ -179,67 +187,84 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
         pair
     }
 
-    fn delete_max(&mut self) -> (K, V) {
-        if self.leaf {
-            return unsafe { self.remove_pair(self.n - 1) };
+    /// # Safety
+    /// Must not be empty
+    unsafe fn delete_max(&mut self) -> (K, V) {
+        if self.is_leaf() {
+            let (key, value) = self.remove_pair(self.n - 1);
+            self.aug_val = A::deleted_sub_tree(&key, &value, &self.aug_val);
+            return (key, value);
         }
 
         if self.children[self.n].is_min() {
-            unsafe {
-                self.make_space(self.n);
-            }
+            self.make_space(self.n);
         }
 
-        self.children[self.n].delete_max()
+        let (key, value) = self.children[self.n].delete_max();
+        self.aug_val = A::deleted_sub_tree(&key, &value, &self.aug_val);
+        (key, value)
     }
 
-    fn delete_min(&mut self) -> (K, V) {
-        if self.leaf {
-            return unsafe { self.remove_pair(0) };
+    /// # Safety
+    /// Must not be empty
+    unsafe fn delete_min(&mut self) -> (K, V) {
+        if self.is_leaf() {
+            let (key, value) = self.remove_pair(0);
+            self.aug_val = A::deleted_sub_tree(&key, &value, &self.aug_val);
+            return (key, value);
         }
 
         if self.children[0].is_min() {
-            unsafe {
-                self.make_space(0);
-            }
+            self.make_space(0);
         }
 
-        self.children[0].delete_min()
+        let (key, value) = self.children[0].delete_min();
+        self.aug_val = A::deleted_sub_tree(&key, &value, &self.aug_val);
+        (key, value)
     }
 
     /// # Safety
     /// Child `idx` and `idx + 1` must exist and have have mininum degree
     unsafe fn merge_children(&mut self, idx: usize) {
-        let parent_key = self.remove_pair(idx);
+        let parent_pair = self.remove_pair(idx);
 
         let mut right_child = self.children.remove(idx + 1);
         let left_child = &mut self.children[idx];
 
-        left_child.keys[MIN_DEGREE - 1] = MaybeUninit::new(parent_key);
+        left_child.aug_val = A::merge(&parent_pair, &left_child.aug_val, &right_child.aug_val);
+
+        left_child.keys[MIN_DEGREE - 1] = MaybeUninit::new(parent_pair);
         for i in 0..MIN_DEGREE - 1 {
             let key = right_child.keys[i].assume_init_read();
             left_child.keys[i + MIN_DEGREE] = MaybeUninit::new(key);
         }
         left_child.n = 2 * MIN_DEGREE - 1;
 
-        if !left_child.leaf {
+        if !left_child.is_leaf() {
             left_child.children.append(&mut right_child.children);
         }
     }
 
     /// # Safety
     /// `idx` must be in the range `[0; self.n)`
-    unsafe fn delete_own(&mut self, idx: usize) {
-        if self.leaf {
-            self.remove_pair(idx);
+    unsafe fn delete_own(&mut self, key: &K, idx: usize) -> V {
+        let value = if self.is_leaf() {
+            self.remove_pair(idx).1
         } else if !self.children[idx].is_min() {
+            let (_, value) = self.keys[idx].assume_init_read();
             self.keys[idx] = MaybeUninit::new(self.children[idx].delete_max());
+            value
         } else if !self.children[idx + 1].is_min() {
+            let (_, value) = self.keys[idx].assume_init_read();
             self.keys[idx] = MaybeUninit::new(self.children[idx + 1].delete_min());
+            value
         } else {
             self.merge_children(idx);
-            self.children[idx].delete_own(MIN_DEGREE - 1);
-        }
+            self.children[idx].delete_own(key, MIN_DEGREE - 1)
+        };
+
+        self.aug_val = A::deleted_sub_tree(key, &value, &self.aug_val);
+        value
     }
 
     /// # Safety
@@ -247,26 +272,61 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
     unsafe fn make_space(&mut self, mut idx: usize) -> usize {
         if idx > 0 && !self.children[idx - 1].is_min() {
             // Steal a key from the left sibling (through parent)
-            self.children[idx].insert_pair(0, self.keys[idx - 1].assume_init_read());
+            let (victim_slice, thief_slice) = self.children.split_at_mut(idx);
+            let thief = &mut thief_slice[0];
+            let victim = &mut victim_slice[idx - 1];
 
-            let sibling = &mut self.children[idx - 1];
-            self.keys[idx - 1] = MaybeUninit::new(sibling.remove_pair(sibling.n - 1));
+            let parent_pair = self.keys[idx - 1].assume_init_read();
+            let sibling_pair = victim.remove_pair(victim.n - 1);
 
-            if !sibling.leaf {
-                let last_child = sibling.children.pop().unwrap();
-                self.children[idx].children.insert(0, last_child);
+            let stolen_child = if victim.is_leaf() {
+                None
+            } else {
+                Some(victim.children.pop().unwrap())
+            };
+
+            (thief.aug_val, victim.aug_val) = A::steal(
+                &parent_pair,
+                &sibling_pair,
+                stolen_child.as_ref().map(|c| &c.aug_val),
+                &thief.aug_val,
+                &victim.aug_val,
+            );
+
+            self.keys[idx - 1] = MaybeUninit::new(sibling_pair);
+            thief.insert_pair(0, parent_pair);
+
+            if let Some(child) = stolen_child {
+                thief.children.insert(0, child);
             }
         } else if idx < self.n && !self.children[idx + 1].is_min() {
             // Steal a key from the right sibling (through parent)
-            let child_n = self.children[idx].n;
-            self.children[idx].insert_pair(child_n, self.keys[idx].assume_init_read());
+            let (thief_slice, victim_slice) = self.children.split_at_mut(idx + 1);
+            let thief = &mut thief_slice[idx];
+            let victim = &mut victim_slice[0];
 
-            let sibling = &mut self.children[idx + 1];
-            self.keys[idx] = MaybeUninit::new(sibling.remove_pair(0));
+            let parent_pair = self.keys[idx].assume_init_read();
+            let sibling_pair = victim.remove_pair(0);
 
-            if !sibling.leaf {
-                let first_child = sibling.children.remove(0);
-                self.children[idx].children.push(first_child);
+            let stolen_child = if victim.is_leaf() {
+                None
+            } else {
+                Some(victim.children.remove(0))
+            };
+
+            (thief.aug_val, victim.aug_val) = A::steal(
+                &parent_pair,
+                &sibling_pair,
+                stolen_child.as_ref().map(|c| &c.aug_val),
+                &thief.aug_val,
+                &victim.aug_val,
+            );
+
+            self.keys[idx] = MaybeUninit::new(sibling_pair);
+            thief.insert_pair(thief.n, parent_pair);
+
+            if let Some(child) = stolen_child {
+                thief.children.push(child);
             }
         } else if idx > 0 {
             // We can merge with the left sibling
@@ -280,27 +340,30 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
         idx
     }
 
-    fn delete_in_decendant(&mut self, mut idx: usize, key: &K) {
-        if self.leaf {
-            return;
+    fn delete_in_decendant(&mut self, mut idx: usize, key: &K) -> Option<V> {
+        if self.is_leaf() {
+            return None;
         }
 
         if self.children[idx].is_min() {
             idx = unsafe { self.make_space(idx) };
         }
 
-        self.children[idx].delete(key);
+        self.children[idx].delete(key).map(|v| {
+            self.aug_val = A::deleted_sub_tree(key, &v, &self.aug_val);
+            v
+        })
     }
 
-    fn delete(&mut self, key: &K) {
+    fn delete(&mut self, key: &K) -> Option<V> {
         match self.find_key_idx(key) {
-            Ok(idx) => unsafe { self.delete_own(idx) },
+            Ok(idx) => unsafe { Some(self.delete_own(key, idx)) },
             Err(idx) => self.delete_in_decendant(idx, key),
         }
     }
 
     fn search(&self, key: &K, mut acc: A::Output) -> (Option<&V>, A::Output) {
-        let (idx, found) = match self.find_key_idx(&key) {
+        let (idx, found) = match self.find_key_idx(key) {
             Ok(i) => (i, true),
             Err(i) => (i, false),
         };
@@ -316,7 +379,7 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
 
         if found {
             (Some(unsafe { &self.keys[idx].assume_init_ref().1 }), acc)
-        } else if self.leaf {
+        } else if self.is_leaf() {
             (None, acc)
         } else {
             self.children[idx].search(key, acc)
@@ -324,11 +387,41 @@ impl<K: Ord, V, A: Augment<K, V>> Node<K, V, A> {
     }
 
     fn is_min(&self) -> bool {
-        self.n <= MIN_DEGREE - 1
+        self.n < MIN_DEGREE
     }
 
     fn is_full(&self) -> bool {
         self.n == 2 * MIN_DEGREE - 1
+    }
+
+    fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
+}
+
+impl<K, V, A> Debug for Node<K, V, A>
+where
+    A: Augment<K, V>,
+    K: Debug,
+    V: Debug,
+    A::Value: Debug,
+{
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.debug_struct("Node")
+            .field(
+                "keys",
+                &format!("[{}]", unsafe {
+                    mem::transmute::<_, &[(K, V)]>(&self.keys[..self.n])
+                        .iter()
+                        .map(|(k, v)| format!("({k:?}, {v:?}), "))
+                        .collect::<String>()
+                        .strip_suffix(", ")
+                        .unwrap()
+                }),
+            )
+            .field("children", &self.children)
+            .field("aug_val", &self.aug_val)
+            .finish()
     }
 }
 
@@ -363,18 +456,18 @@ impl<K: Ord, V, A: Augment<K, V>> BTree<K, V, A> {
             self.root.keys[0] = MaybeUninit::new(root_pair);
             self.root.children.push(old_root);
             self.root.children.push(child);
-            self.root.leaf = false;
             self.root.n = 1;
         }
 
         self.root.insert_non_full(key, value).is_ok()
     }
 
-    pub fn delete(&mut self, key: &K) {
-        self.root.delete(key);
+    pub fn delete(&mut self, key: &K) -> Option<V> {
+        let res = self.root.delete(key);
         if self.root.children.len() == 1 {
             self.root = self.root.children.pop().unwrap();
         }
+        res
     }
 
     pub fn search(&self, key: &K) -> Option<&V> {
@@ -383,6 +476,14 @@ impl<K: Ord, V, A: Augment<K, V>> BTree<K, V, A> {
 
     pub fn augment_search(&self, key: &K) -> A::Output {
         self.root.search(key, A::initial_output()).1
+    }
+}
+
+impl<K: Ord, V, A: Augment<K, V>> Default for BTree<K, V, A> {
+    fn default() -> Self {
+        Self {
+            root: Node::new_root(),
+        }
     }
 }
 
@@ -431,7 +532,13 @@ mod tests {
 
         for i in 0..4000 {
             if i % 5 == 0 || i % 11 == 0 {
-                tree.delete(&i);
+                assert!(tree.delete(&i).is_some());
+            }
+        }
+
+        for i in 1000..3000 {
+            if i % 5 == 0 || i % 11 == 0 {
+                assert!(tree.delete(&i).is_none());
             }
         }
 
