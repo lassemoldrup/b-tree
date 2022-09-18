@@ -4,7 +4,7 @@ use std::mem::{self, MaybeUninit};
 
 pub mod augments;
 
-const MIN_DEGREE: usize = 4;
+const MIN_DEGREE: usize = 6;
 
 pub trait Augment<K, V> {
     type Value;
