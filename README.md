@@ -1,0 +1,2 @@
+# Augmented B-tree
+An implementation of an augmented B-tree in Rust. Currently, the only augmentation implemented is one that can sum up all values below a certain point in `O(log n)` time. Note: The library is neither polished nor optimized, so use it at your own risk.
